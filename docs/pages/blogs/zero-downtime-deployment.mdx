@@ -1,0 +1,111 @@
+# Zero Downtime Deployment
+
+*** - October 16th, 2023
+
+---
+When serving any hosted product, deploying updates without disrupting the user experience is crucial. At Sweep, we prioritize ensuring that our services are continuously available, even during deployments. One method that has significantly contributed to this is Zero Downtime Deployment (ZDD). Through a well-orchestrated script, we manage our Docker containers to achieve seamless deployments. In this blog, we’ll dive into our deployment script and explain how it aligns with the principles of ZDD, helping us deliver continuous value to our users.
+
+## Older Container Removal 
+
+The initial step of the deployment scripts focused on housekeeping. The script starts by listing all active Docker containers. It identifies containers beyond the most recent two for removal, allowing for a rollback capability if needed. To ensure that we do not interrupt any ongoing transactions, we let Docker containers finish processing their ongoing requests before removal. 
+
+```bash filename="deploy.sh" showLineNumbers
+# Remove old docker images only after 2 runs to allow for rollbacks.
+# Docker images also need to finish processing their requests before they can be removed.
+echo `docker ps`
+containers_to_remove=$(docker ps -q | awk 'NR>2')
+```
+The awk `NR>2` command filters out the first two containers, ensuring they are kept for rollback purposes. The remaining containers are stored in the variable `containers_to_remove`.
+```bash filename="deploy.sh" showLineNumbers
+if [ ! -z "$containers_to_remove" ]; then
+    echo "Removing old docker runs"
+    docker rm -f $containers_to_remove
+else
+    echo "No old docker runs to remove"
+fi
+```
+
+The `if` statement checks if `containers_to_remove` is not empty. If it’s not, the `docker rm -f $containers_to_remove` command forcefully removes the old containers, ensuring a clean environment for the new deployment.
+
+
+## Port Allocation 
+Having cleared the old containers, the script transitions to preparing the ground for the new deployment. A crucial part of this preparation is finding a suitable port for the new container. The script dynamically allocates a port to avoid any conflicts, ensuring that the new version can be deployed alongside the old ones seamlessly. Here, we start with a defined port `8081` and employs a while-loop to increment the port number until a free port is found. 
+
+
+```bash filename="deploy.sh" showLineNumbers
+# Find next available port to deploy to
+PORT=8081
+is_port_free() {
+    lsof -i :$1 > /dev/null
+    return $?
+}
+
+while is_port_free $PORT; do
+    ((PORT++))
+done
+
+echo "Found open port: $PORT"
+```
+
+The `is_port_free()` function utilizes the `lsof` command to check if a port is free. The `lsof -i :$1` command lists all processes using the specified port `$1`, redirecting the output to `/dev/null` to suppress it. The `return $?` statement returns the exit status of the lsof command, which is 0 if the port is occupied and 1 if it's free. The while-loop continues until a free port is found, incrementing the `PORT` variable in each iteration.
+
+## New Container Deployment 
+With a clean environment and an allocated port, we are now ready for the new deployment. The script transitions to Sweep.ai application directory, builds a new Docker image, and deploys a new container on the allocated port. This step is fundamental in ensuring consistency across deployments. 
+
+```bash filename="deploy.sh" showLineNumbers
+# Start new docker container on the next available port
+cd ~/sweep
+docker build -t sweepai/sweep:latest .
+docker run -v $(pwd)/logn_logs:/app/logn_logs -v $(pwd)/sweep_docs:/app/sweep_docs --env-file .env -p $PORT:8080 -d sweepai/sweep:latest
+```
+
+The  `docker build -t sweepai/sweep:latest . `command builds a new Docker image tagged as `sweepai/sweep:latest`. `docker run` then creates and starts a new Docker container from this image. The `-v` flags mount local directories to directories within the container, allowing data persistence. The `--env-file` flag specifies an environment file, and the `-p` flag maps the allocated port to port `8080` within the container.
+
+## Health Check 
+
+After deployment, we want to make sure that the new deployment is functioning as expected. The script continuously performs health checks on the new deployment. This proactive monitoring ensures that the new version is fully operational before proceeding.
+
+```bash filename="deploy.sh" showLineNumbers
+# Wait until webhook is available before rerouting traffic to it
+echo "Waiting for server to start..."
+while true; do
+    curl --output /dev/null --silent --fail http://localhost:$PORT/health
+    if [ $? -eq 0 ]; then
+        echo "Received a good response!"
+        break
+    else
+        printf '.'
+        sleep 1
+    fi
+done
+```
+
+The  `curl --output /dev/null --silent --fail http://localhost:$PORT/health` command sends an HTTP request to the health endpoint, suppressing the output and errors. The `if` statement checks the exit status of the `curl` command, where `0` indicates a successful response, and any other value indicates failure. The loop continues until a successful response is received, ensuring the new deployment is ready to handle traffic.
+
+
+## Traffic Rerouting
+With a fully operational new deployment, the final step is to ensure that our users are directed to the new version of sweep. Our script reroutes traffic to the new container by updating ngrok proxy to point to the new port. This seamless shift of traffic to the new version ensures that the user expererience remains consistent and uninterrupted. 
+
+```bash filename="deploy.sh" showLineNumbers
+# Update the ngrok proxy to point to the new port
+screen -list | grep -q "\bngrok\b"
+SESSION_EXISTS=$?
+
+if [ $SESSION_EXISTS -ne 0 ]; then
+    screen -S ngrok -d -m
+    echo creating new session
+    sleep 1
+fi
+
+# Kill the ngrok process if it's already running
+screen -S ngrok -X stuff $'\003'
+sleep 1
+screen -S ngrok -X stuff $'ngrok http --domain=sweep-prod.ngrok.dev '$PORT$'\n'
+```
+
+The script checks for existing ngrok sessions using `screen -list | grep -q "bngrok\b" ` command. If no session exists, a new screen session named `ngrok` is created. The `screen -S ngrok -X stuff` commands then send keyboard inputs to the ngrok screen session, first sending Ctrl+C to stop any running ngrok process, then starting a new ngrok process with the updated port. 
+
+
+## Conclusion
+
+We're excited to see what the future holds for code planning and to hear your thoughts on it. If you have ideas, feel free to share them in our [community](https://discord.gg/sweep).
